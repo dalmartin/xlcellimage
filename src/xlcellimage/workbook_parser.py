@@ -13,6 +13,8 @@ from zipfile import ZipFile
 ##############Files to Parse ##########################################
 METADATAFILES = [
                     "xl/metadata.xml",
+                    "xl/richData/rdrichvalue.xml",
+                    "xl/richData/rdrichvaluestructure.xml",
                     "xl/richData/richValueRel.xml",
                     "xl/richData/_rels/richValueRel.xml.rels",
                 ]
@@ -21,6 +23,11 @@ NS = {
          "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
          "rvr": "http://schemas.microsoft.com/office/spreadsheetml/2022/richvaluerel",
          "relations": "http://schemas.openxmlformats.org/package/2006/relationships",
+         # xlrd: prefix inside metadata.xml, and the root namespace of
+         # rdrichvalue.xml / rdrichvaluestructure.xml
+         "richdata": "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata",
+         # namespace of the r:id attribute on richValueRel.xml's <rel> elements
+         "odoc": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
      }
 ########################################################################
 
@@ -55,7 +62,15 @@ class WorkbookParser:
     ######## Eager load information (except for image bytes) from the workbook
 
     def _readXml(self, path: str):
-        bytes = self.zip.read(path)
+        try:
+            bytes = self.zip.read(path)
+        except KeyError:
+            # Some rich-data parts (e.g. rdrichvalue.xml / rdrichvaluestructure.xml)
+            # only exist when the workbook actually contains in-cell images.
+            # Treat an absent part as "no data" rather than raising, so a
+            # workbook without rich-value images still parses cleanly and
+            # simply resolves no images (see hasImage/getImage).
+            return
         root = ET.fromstring(bytes)
         self.parsed[path] = root
 
@@ -80,35 +95,126 @@ class WorkbookParser:
                     self.cellToVM[(sheetName, cell)] = vm
 
     def _getV(self):
-        # get the metadata parsed
+        # Resolve each cell's vm (hop 1, already in cellToVM, 1-based) to the
+        # futureMetadata block index (hops 2-4):
+        #   2. valueMetadata/bk[vm - 1]   (vm is 1-based, so decrement)
+        #   3. within that <bk>, a cell can have more than one <rc> (e.g. one
+        #      for XLDAPR dynamic-array metadata and one for XLRICHVALUE), so
+        #      find the specific <rc> whose t (1-based) indexes
+        #      metadataTypes/metadataType[t - 1] and whose name is
+        #      "XLRICHVALUE" -- never just take the first <rc>.
+        #   4. that <rc>'s v attribute is the futureMetadata block index,
+        #      0-based (do NOT decrement).
+        if "xl/metadata.xml" not in self.parsed:
+            return
+
         data = self.getData("xl/metadata.xml")
-        idxV: dict[int, str] = {}
 
-        # populate a metadata value index to a metadata value
-        for i, rc in enumerate(data.findall(".//main:rc", NS)):
-            v = rc.get("v")
-            if v:
-                idxV[i+1] = v
+        metadataTypes = data.findall("main:metadataTypes/main:metadataType", NS)
+        valueMetadataBks = data.findall("main:valueMetadata/main:bk", NS)
 
-        # populate cell to metadata value
         for cell, vm in self.cellToVM.items():
-            self.cellToV[cell] = idxV[int(vm)]
+            bkIndex = int(vm) - 1  # hop 2: vm is 1-based
+            if not (0 <= bkIndex < len(valueMetadataBks)):
+                continue
+
+            for rc in valueMetadataBks[bkIndex].findall("main:rc", NS):
+                t = rc.get("t")
+                v = rc.get("v")
+                if t is None or v is None:
+                    continue
+                typeIndex = int(t) - 1  # hop 3: t is 1-based
+                if 0 <= typeIndex < len(metadataTypes) and metadataTypes[typeIndex].get("name") == "XLRICHVALUE":
+                    self.cellToV[cell] = v  # hop 4: 0-based, do NOT decrement
+                    break
 
     def _getRID(self):
-        # get rich value relation data
-        data = self.getData("xl/richData/richValueRel.xml")
-        idxRID: dict[int, str] = {}
+        # Resolve each cell's futureMetadata block index (cellToV, hop 4) to
+        # the final rId string referenced by richValueRel.xml (hops 5-9):
+        #   5. futureMetadata[@name='XLRICHVALUE']/bk[v] -> xlrd:rvb[@i]
+        #      (v is 0-based, do NOT decrement; i is the 0-based rv index,
+        #      do NOT decrement)
+        #   6. rdrichvalue.xml: the <rv> at document-order position i; its s
+        #      attribute is the 0-based structure index
+        #   7. rdrichvaluestructure.xml: the <s> at document-order position
+        #      s; find the 0-based position of its
+        #      <k n="_rvRel:LocalImageIdentifier"> child
+        #   8. back on the <rv> from hop 6: the <v> child at that same
+        #      position (v children correspond positionally to the
+        #      structure's k children); its text is the
+        #      LocalImageIdentifier, 0-based, do NOT decrement
+        #   9. richValueRel.xml: the <rel> at document-order LIST POSITION
+        #      LocalImageIdentifier (never by parsing/sorting the rId
+        #      numeric suffix); read its r:id attribute string
+        required = (
+            "xl/metadata.xml",
+            "xl/richData/rdrichvalue.xml",
+            "xl/richData/rdrichvaluestructure.xml",
+            "xl/richData/richValueRel.xml",
+        )
+        if any(path not in self.parsed for path in required):
+            return
 
-        for i, rel in enumerate(data.findall(".//rvr:rel", NS)):
-            rid = rel.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
-            if rid:
-                idxRID[i] = rid
+        metadata = self.getData("xl/metadata.xml")
+        futureMetadataBks = metadata.findall(
+            "main:futureMetadata[@name='XLRICHVALUE']/main:bk", NS
+        )
+
+        rvDataRoot = self.getData("xl/richData/rdrichvalue.xml")
+        rvs = rvDataRoot.findall("richdata:rv", NS)
+
+        rvStructuresRoot = self.getData("xl/richData/rdrichvaluestructure.xml")
+        structures = rvStructuresRoot.findall("richdata:s", NS)
+
+        richValueRelRoot = self.getData("xl/richData/richValueRel.xml")
+        rels = richValueRelRoot.findall("rvr:rel", NS)
 
         for cell, v in self.cellToV.items():
-            self.cellToRID[cell] = idxRID[int(v)]
+            vIndex = int(v)  # hop 4 result: 0-based, do NOT decrement
+            if not (0 <= vIndex < len(futureMetadataBks)):
+                continue
+
+            rvb = futureMetadataBks[vIndex].find(".//richdata:rvb", NS)
+            if rvb is None or rvb.get("i") is None:
+                continue
+            rvIndex = int(rvb.get("i"))  # hop 5: 0-based, do NOT decrement
+            if not (0 <= rvIndex < len(rvs)):
+                continue
+            rv = rvs[rvIndex]  # hop 6
+
+            structIndexAttr = rv.get("s")
+            if structIndexAttr is None:
+                continue
+            structIndex = int(structIndexAttr)
+            if not (0 <= structIndex < len(structures)):
+                continue
+            structure = structures[structIndex]  # hop 7
+
+            keys = structure.findall("richdata:k", NS)
+            keyPosition = None
+            for i, k in enumerate(keys):
+                if k.get("n") == "_rvRel:LocalImageIdentifier":
+                    keyPosition = i
+                    break
+            if keyPosition is None:
+                continue
+
+            values = rv.findall("richdata:v", NS)  # hop 8
+            if keyPosition >= len(values) or values[keyPosition].text is None:
+                continue
+            localImageIdentifier = int(values[keyPosition].text)  # 0-based, do NOT decrement
+
+            if not (0 <= localImageIdentifier < len(rels)):
+                continue
+            rid = rels[localImageIdentifier].get(f"{{{NS['odoc']}}}id")  # hop 9
+            if rid:
+                self.cellToRID[cell] = rid
 
     def _getImgPath(self):
         # _get rich value relationships (actual path to images)
+        if "xl/richData/_rels/richValueRel.xml.rels" not in self.parsed:
+            return
+
         data = self.getData("xl/richData/_rels/richValueRel.xml.rels")
         ridImgPath: dict[str, str] = {}
 
