@@ -177,7 +177,7 @@ class WorkbookParser:
             rvb = futureMetadataBks[vIndex].find(".//richdata:rvb", NS)
             if rvb is None or rvb.get("i") is None:
                 continue
-            rvIndex = int(rvb.get("i"))  # hop 5: 0-based, do NOT decrement
+            rvIndex = int(rvb.get("i"))  # hop 5: 0-based, do NOT decrement  # pyright: ignore[reportArgumentType]
             if not (0 <= rvIndex < len(rvs)):
                 continue
             rv = rvs[rvIndex]  # hop 6
@@ -202,7 +202,7 @@ class WorkbookParser:
             values = rv.findall("richdata:v", NS)  # hop 8
             if keyPosition >= len(values) or values[keyPosition].text is None:
                 continue
-            localImageIdentifier = int(values[keyPosition].text)  # 0-based, do NOT decrement
+            localImageIdentifier = int(values[keyPosition].text)  # 0-based, do NOT decrement  # pyright: ignore[reportArgumentType]
 
             if not (0 <= localImageIdentifier < len(rels)):
                 continue
