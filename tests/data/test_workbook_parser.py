@@ -1,6 +1,7 @@
+import pytest
+
 from xlcellimage.workbook_parser import WorkbookParser
 
-import pytest
 
 class TestWorkbookParser:
 
