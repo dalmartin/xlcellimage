@@ -1,4 +1,4 @@
-from xlcellimage.workbook_parser import WorkbookParser
 from xlcellimage.image_loader import ImageLoader
+from xlcellimage.workbook_parser import WorkbookParser
 
-__all__ = ["WorkbookParser", "ImageLoader"]
+__all__ = ["ImageLoader", "WorkbookParser"]
